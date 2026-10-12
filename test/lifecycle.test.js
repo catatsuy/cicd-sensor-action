@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
-import { runPost, stopManagedAgent } from '../src/post.js';
+import { logShutdownDiagnostics, runPost, stopManagedAgent } from '../src/post.js';
 
 let oldEnv, oldExitCode;
 beforeEach(() => {
@@ -29,6 +29,8 @@ function systemd(states, signalResult = { status: 0 }) {
   let reads = 0;
   mock.method(childProcess, 'spawnSync', (cmd, args) => {
     calls.push([cmd, args]);
+    if (args[0] === 'show') return { status: 0, stdout: 'MainPID=123\nActiveState=active' };
+    if (cmd === 'sudo' && args[1] === 'journalctl') return { status: 0, stdout: 'agent_stopped' };
     if (cmd === 'sudo') return signalResult;
     assert.equal(cmd, 'systemctl');
     const value = states[Math.min(reads++, states.length - 1)];
@@ -64,7 +66,7 @@ describe('managed Agent shutdown', () => {
       }
       if (c.error) await assert.rejects(stopManagedAgent(), c.error);
       else await stopManagedAgent();
-      const signals = calls.filter(([cmd]) => cmd === 'sudo');
+      const signals = calls.filter(([cmd, args]) => cmd === 'sudo' && args[1] === 'systemctl');
       assert.equal(signals.length, c.signals);
       for (const [, args] of signals) assert.deepEqual(args, [
         '-n', 'systemctl', 'kill', '--kill-who=main', '--signal=SIGTERM', 'cicd-sensor-agent.service',
@@ -93,7 +95,7 @@ describe('post cleanup', () => {
       }
       try {
         await runPost();
-        assert.equal(calls.filter(([cmd]) => cmd === 'sudo').length, 1);
+        assert.equal(calls.filter(([cmd, args]) => cmd === 'sudo' && args[1] === 'systemctl').length, 1);
         assert.equal(fs.existsSync(token), false);
         assert.equal(process.exitCode, c.reportFails || c.stopFails ? 1 : oldExitCode);
       } finally {
@@ -101,6 +103,43 @@ describe('post cleanup', () => {
       }
     });
   }
+});
+
+describe('shutdown diagnostics', () => {
+  it('bounds queries and collects exit status plus the post-signal journal', () => {
+    const calls = [];
+    mock.method(childProcess, 'spawnSync', (cmd, args, opts) => {
+      calls.push([cmd, args, opts]);
+      return { status: 0, stdout: 'diagnostic output' };
+    });
+    syncBuiltinESMExports();
+    logShutdownDiagnostics('shutdown timed out', '2026-10-12T00:00:00.000Z');
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0][0], 'systemctl');
+    for (const property of ['MainPID', 'SubState', 'Result', 'ExecMainCode', 'ExecMainStatus']) {
+      assert.ok(calls[0][1][2].includes(property));
+    }
+    assert.deepEqual(calls[1][1], [
+      '-n', 'journalctl', '-u', 'cicd-sensor-agent.service', '--no-pager',
+      '--output=short-monotonic', '--since', '2026-10-12T00:00:00.000Z', '--lines=200',
+    ]);
+    for (const [, , opts] of calls) {
+      assert.equal(opts.timeout, 5_000);
+      assert.equal(opts.maxBuffer, 1024 * 1024);
+    }
+  });
+
+  it('diagnostic failures do not replace the shutdown outcome', async () => {
+    mock.method(childProcess, 'spawnSync', (cmd, args) => {
+      if (args[0] === 'show' || args[1] === 'journalctl') throw new Error('diagnostics unavailable');
+      if (cmd === 'sudo') return { status: 0 };
+      return { status: 0, stdout: 'active' };
+    });
+    syncBuiltinESMExports();
+    let ticks = 0;
+    mock.method(Date, 'now', () => ticks++ === 0 ? 0 : 30_000);
+    await assert.rejects(stopManagedAgent(), /did not exit within 30s/);
+  });
 });
 
 // Explicit opt-in: a disposable Ubuntu CI VM with no existing Agent.

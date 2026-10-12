@@ -475,12 +475,45 @@ function agentIsRunning() {
   throw new Error(`cannot wait for agent exit: ${state || r.stderr || r.status}`);
 }
 
+// These observations must never decide whether shutdown succeeded or mask a
+// failure. In particular, MainPID=0 alone is not proof of a clean exit.
+export function logShutdownDiagnostics(phase, journalSince) {
+  core.info(`==> Managed agent shutdown diagnostics (${phase})`);
+  const properties = [
+    'LoadState', 'ActiveState', 'SubState', 'MainPID', 'ControlPID',
+    'Result', 'ExecMainCode', 'ExecMainStatus', 'NRestarts',
+    'TimeoutStopUSec', 'KillMode', 'ControlGroup',
+  ];
+  const queries = [
+    ['systemctl', ['show', AGENT_UNIT_NAME, `--property=${properties.join(',')}`]],
+  ];
+  if (journalSince) queries.push(['sudo', [
+    '-n', 'journalctl', '-u', AGENT_UNIT_NAME, '--no-pager',
+    '--output=short-monotonic', '--since', journalSince, '--lines=200',
+  ]]);
+  for (const [command, args] of queries) {
+    try {
+      const result = spawnSync(command, args, {
+        encoding: 'utf8', timeout: 5_000, maxBuffer: 1024 * 1024,
+      });
+      if (result.stdout) core.info(result.stdout.trim());
+      if (result.error || result.status !== 0) {
+        core.warning(`shutdown diagnostic ${command} failed: ${result.error?.message || result.stderr || result.status}`);
+      }
+    } catch (error) {
+      core.warning(`shutdown diagnostic ${command} failed: ${error.message}`);
+    }
+  }
+}
+
 export async function stopManagedAgent() {
   if (core.getState(STATE.reusedExistingAgent) !== 'false' ||
       core.getState(STATE.managedAgentStarted) !== 'true') return;
   if (!agentIsRunning()) return;
 
   core.info('==> Sending SIGTERM to managed agent and waiting for exit');
+  const journalSince = new Date().toISOString();
+  logShutdownDiagnostics('before SIGTERM');
   // RefuseManualStop=yes prevents systemctl stop; SIGTERM uses the existing
   // Agent shutdown path. Keep the existing 20-second drain budget intact.
   const r = spawnSync('sudo', [
@@ -490,14 +523,27 @@ export async function stopManagedAgent() {
   if (r.status !== 0) throw new Error(`agent SIGTERM failed: ${r.stderr || r.status}`);
 
   const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    if (!agentIsRunning()) {
-      core.info('Managed agent shutdown wait completed');
-      return;
+  let nextDiagnostic = deadline - 25_000;
+  let phase = 'shutdown failed';
+  try {
+    logShutdownDiagnostics('after SIGTERM');
+    while (Date.now() < deadline) {
+      if (!agentIsRunning()) {
+        phase = 'shutdown completed';
+        core.info('Managed agent shutdown wait completed');
+        return;
+      }
+      if (Date.now() >= nextDiagnostic) {
+        logShutdownDiagnostics('waiting');
+        nextDiagnostic = Date.now() + 5_000;
+      }
+      await sleep(200);
     }
-    await sleep(200);
+    phase = 'shutdown timed out';
+    throw new Error('managed agent did not exit within 30s after SIGTERM; logs may be incomplete');
+  } finally {
+    logShutdownDiagnostics(phase, journalSince);
   }
-  throw new Error('managed agent did not exit within 30s after SIGTERM; logs may be incomplete');
 }
 
 // Finalize even after setup/report failure, and retain the token until then.

@@ -77789,6 +77789,7 @@ var __webpack_exports__ = {};
 
 // EXPORTS
 __nccwpck_require__.d(__webpack_exports__, {
+  lI: () => (/* binding */ logShutdownDiagnostics),
   a2: () => (/* binding */ runPost),
   A9: () => (/* binding */ stepSummaryArgs),
   Zr: () => (/* binding */ stopManagedAgent)
@@ -138347,12 +138348,45 @@ function agentIsRunning() {
   throw new Error(`cannot wait for agent exit: ${state || r.stderr || r.status}`);
 }
 
+// These observations must never decide whether shutdown succeeded or mask a
+// failure. In particular, MainPID=0 alone is not proof of a clean exit.
+function logShutdownDiagnostics(phase, journalSince) {
+  info(`==> Managed agent shutdown diagnostics (${phase})`);
+  const properties = [
+    'LoadState', 'ActiveState', 'SubState', 'MainPID', 'ControlPID',
+    'Result', 'ExecMainCode', 'ExecMainStatus', 'NRestarts',
+    'TimeoutStopUSec', 'KillMode', 'ControlGroup',
+  ];
+  const queries = [
+    ['systemctl', ['show', AGENT_UNIT_NAME, `--property=${properties.join(',')}`]],
+  ];
+  if (journalSince) queries.push(['sudo', [
+    '-n', 'journalctl', '-u', AGENT_UNIT_NAME, '--no-pager',
+    '--output=short-monotonic', '--since', journalSince, '--lines=200',
+  ]]);
+  for (const [command, args] of queries) {
+    try {
+      const result = (0,external_node_child_process_namespaceObject.spawnSync)(command, args, {
+        encoding: 'utf8', timeout: 5_000, maxBuffer: 1024 * 1024,
+      });
+      if (result.stdout) info(result.stdout.trim());
+      if (result.error || result.status !== 0) {
+        warning(`shutdown diagnostic ${command} failed: ${result.error?.message || result.stderr || result.status}`);
+      }
+    } catch (error) {
+      warning(`shutdown diagnostic ${command} failed: ${error.message}`);
+    }
+  }
+}
+
 async function stopManagedAgent() {
   if (getState(STATE.reusedExistingAgent) !== 'false' ||
       getState(STATE.managedAgentStarted) !== 'true') return;
   if (!agentIsRunning()) return;
 
   info('==> Sending SIGTERM to managed agent and waiting for exit');
+  const journalSince = new Date().toISOString();
+  logShutdownDiagnostics('before SIGTERM');
   // RefuseManualStop=yes prevents systemctl stop; SIGTERM uses the existing
   // Agent shutdown path. Keep the existing 20-second drain budget intact.
   const r = (0,external_node_child_process_namespaceObject.spawnSync)('sudo', [
@@ -138362,14 +138396,27 @@ async function stopManagedAgent() {
   if (r.status !== 0) throw new Error(`agent SIGTERM failed: ${r.stderr || r.status}`);
 
   const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    if (!agentIsRunning()) {
-      info('Managed agent shutdown wait completed');
-      return;
+  let nextDiagnostic = deadline - 25_000;
+  let phase = 'shutdown failed';
+  try {
+    logShutdownDiagnostics('after SIGTERM');
+    while (Date.now() < deadline) {
+      if (!agentIsRunning()) {
+        phase = 'shutdown completed';
+        info('Managed agent shutdown wait completed');
+        return;
+      }
+      if (Date.now() >= nextDiagnostic) {
+        logShutdownDiagnostics('waiting');
+        nextDiagnostic = Date.now() + 5_000;
+      }
+      await (0,promises_namespaceObject.setTimeout)(200);
     }
-    await (0,promises_namespaceObject.setTimeout)(200);
+    phase = 'shutdown timed out';
+    throw new Error('managed agent did not exit within 30s after SIGTERM; logs may be incomplete');
+  } finally {
+    logShutdownDiagnostics(phase, journalSince);
   }
-  throw new Error('managed agent did not exit within 30s after SIGTERM; logs may be incomplete');
 }
 
 // Finalize even after setup/report failure, and retain the token until then.
@@ -138402,7 +138449,8 @@ if (isDirectRun()) {
 
 
 
+var __webpack_exports__logShutdownDiagnostics = __webpack_exports__.lI;
 var __webpack_exports__runPost = __webpack_exports__.a2;
 var __webpack_exports__stepSummaryArgs = __webpack_exports__.A9;
 var __webpack_exports__stopManagedAgent = __webpack_exports__.Zr;
-export { __webpack_exports__runPost as runPost, __webpack_exports__stepSummaryArgs as stepSummaryArgs, __webpack_exports__stopManagedAgent as stopManagedAgent };
+export { __webpack_exports__logShutdownDiagnostics as logShutdownDiagnostics, __webpack_exports__runPost as runPost, __webpack_exports__stepSummaryArgs as stepSummaryArgs, __webpack_exports__stopManagedAgent as stopManagedAgent };
